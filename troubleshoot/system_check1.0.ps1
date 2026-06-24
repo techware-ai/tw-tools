@@ -478,7 +478,7 @@ function Export-Report {
             "  Support   : $SupportEmail",
             "=" * 70
         )
-        $header + $Output | Set-Content -Path $ReportPath -Encoding UTF8
+        ($header + $Output.ToArray()) | Set-Content -Path $ReportPath -Encoding UTF8
         Write-Host ""
         Write-Host "  Report saved to:" -ForegroundColor $C.OK
         Write-Host "  $ReportPath" -ForegroundColor $C.Header
