@@ -469,16 +469,11 @@ function Get-WindowsInfo {
 function Export-Report {
     Write-Section "Export Report" 7
 
-    try {
-        # Resolve Desktop via shell — works even if folder is redirected or localised
-        $shell     = New-Object -ComObject Shell.Application
-        $desktopPath = $shell.Namespace(0).Self.Path
-        if (-not (Test-Path $desktopPath)) {
-            New-Item -ItemType Directory -Path $desktopPath -Force | Out-Null
-        }
-        $reportFile = Join-Path $desktopPath "TW_SystemCheck_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+    $stamp      = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $reportFile = "C:\TW_SystemCheck_$stamp.txt"
 
-        $sep = ("=" * 70)
+    try {
+        $sep    = ("=" * 70)
         $header = [string[]]@(
             $sep,
             "  $ScriptName",
@@ -493,16 +488,8 @@ function Export-Report {
         Write-Host "  Report saved to:" -ForegroundColor $C.OK
         Write-Host "  $reportFile" -ForegroundColor $C.Header
     } catch {
-        # Fallback: save next to script or TEMP
-        try {
-            $fallback = Join-Path $env:TEMP "TW_SystemCheck_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-            $all | Out-File -FilePath $fallback -Encoding UTF8
-            Write-Host ""
-            Write-Host "  [!] Desktop not found. Report saved to:" -ForegroundColor $C.Warn
-            Write-Host "  $fallback" -ForegroundColor $C.Header
-        } catch {
-            Write-Host "  [!] Failed to save report: $_" -ForegroundColor $C.Error
-        }
+        Write-Host "  [!] Failed to save report: $_" -ForegroundColor $C.Error
+        Write-Host "  [i] Tried path: $reportFile" -ForegroundColor $C.Dim
     }
 }
 
