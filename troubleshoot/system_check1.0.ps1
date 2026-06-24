@@ -470,6 +470,14 @@ function Export-Report {
     Write-Section "Export Report" 7
 
     try {
+        # Resolve Desktop via shell — works even if folder is redirected or localised
+        $shell     = New-Object -ComObject Shell.Application
+        $desktopPath = $shell.Namespace(0).Self.Path
+        if (-not (Test-Path $desktopPath)) {
+            New-Item -ItemType Directory -Path $desktopPath -Force | Out-Null
+        }
+        $reportFile = Join-Path $desktopPath "TW_SystemCheck_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+
         $sep = ("=" * 70)
         $header = [string[]]@(
             $sep,
@@ -480,12 +488,21 @@ function Export-Report {
             $sep
         )
         $all = $header + [string[]]$Output.ToArray()
-        [System.IO.File]::WriteAllLines($ReportPath, $all, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllLines($reportFile, $all, [System.Text.Encoding]::UTF8)
         Write-Host ""
         Write-Host "  Report saved to:" -ForegroundColor $C.OK
-        Write-Host "  $ReportPath" -ForegroundColor $C.Header
+        Write-Host "  $reportFile" -ForegroundColor $C.Header
     } catch {
-        Write-Host "  [!] Failed to save report: $_" -ForegroundColor $C.Error
+        # Fallback: save next to script or TEMP
+        try {
+            $fallback = Join-Path $env:TEMP "TW_SystemCheck_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+            $all | Out-File -FilePath $fallback -Encoding UTF8
+            Write-Host ""
+            Write-Host "  [!] Desktop not found. Report saved to:" -ForegroundColor $C.Warn
+            Write-Host "  $fallback" -ForegroundColor $C.Header
+        } catch {
+            Write-Host "  [!] Failed to save report: $_" -ForegroundColor $C.Error
+        }
     }
 }
 
