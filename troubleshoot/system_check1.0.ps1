@@ -470,15 +470,17 @@ function Export-Report {
     Write-Section "Export Report" 7
 
     try {
-        $header = @(
-            "=" * 70,
+        $sep = ("=" * 70)
+        $header = [string[]]@(
+            $sep,
             "  $ScriptName",
             "  Generated : $RunDate",
             "  Device    : $env:COMPUTERNAME",
             "  Support   : $SupportEmail",
-            "=" * 70
+            $sep
         )
-        ($header + $Output.ToArray()) | Set-Content -Path $ReportPath -Encoding UTF8
+        $all = $header + [string[]]$Output.ToArray()
+        [System.IO.File]::WriteAllLines($ReportPath, $all, [System.Text.Encoding]::UTF8)
         Write-Host ""
         Write-Host "  Report saved to:" -ForegroundColor $C.OK
         Write-Host "  $ReportPath" -ForegroundColor $C.Header
