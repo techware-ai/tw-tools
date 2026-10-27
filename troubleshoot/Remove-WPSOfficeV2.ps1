@@ -24,6 +24,9 @@
 .PARAMETER Reboot
     Reboot automatically 60 seconds after completion.
 
+.PARAMETER NoPause
+    Don't wait for a key press at the end (pause is skipped automatically under SYSTEM / RMM).
+
 .PARAMETER LogPath
     Folder for the transcript log. Default: C:\ProgramData\WPS-Removal\Logs
 
@@ -39,7 +42,7 @@
       1     Items still remain after cleanup - check the log
 
 .NOTES
-    Version : 2.0.0
+    Version : 2.1.0
     Author  : Techware IT Services PLT
     Limitation: On Windows 11 the UCPD driver protects UserChoice keys, so per-user
     default apps that pointed to WPS must be reset via Settings > Apps > Default apps.
@@ -48,11 +51,12 @@
 param(
     [switch]$SkipUninstaller,
     [switch]$Reboot,
+    [switch]$NoPause,
     [string]$LogPath = "$env:ProgramData\WPS-Removal\Logs"
 )
 
 $ErrorActionPreference = 'Continue'
-$ScriptVersion = '2.0.0'
+$ScriptVersion = '2.1.0'
 $logDir = $LogPath
 New-Item -ItemType Directory -Path $logDir -Force | Out-Null
 $logFile = Join-Path $logDir ('WPS-Removal_{0:yyyyMMdd_HHmmss}.log' -f (Get-Date))
@@ -568,30 +572,91 @@ foreach ($pr in $Profiles) {
 # Items still present only because they are queued for deletion at reboot are not failures
 $pendingOnly = $script:PendingReboot -and (@($left | Where-Object { $_ -notlike 'Folder:*' }).Count -eq 0)
 
-if ($left.Count -eq 0) { Write-Host "`n  WPS Office removed cleanly." -ForegroundColor Green }
-elseif ($pendingOnly) {
-    Write-Host "`n  WPS Office removed. These folders are queued for deletion at next reboot:" -ForegroundColor Yellow
-    $left | ForEach-Object { Write-Host "    $_" -ForegroundColor Yellow }
-}
-else { Write-Warning 'Remaining items:'; $left | ForEach-Object { Write-Host "    $_" -ForegroundColor Red } }
+$exitCode = if ($left.Count -eq 0 -and -not $script:PendingReboot) { 0 }
+            elseif ($left.Count -eq 0 -or $pendingOnly)          { 3010 }
+            else                                                  { 1 }
 
+# ---------------------------------------------------------------- 11. final status report
+function Write-StatusRow([string]$Item, [string]$Result, [string]$Status) {
+    $tag, $color = switch ($Status) {
+        'OK'   { '[ OK ]', 'Green' }
+        'WARN' { '[WARN]', 'Yellow' }
+        'FAIL' { '[FAIL]', 'Red' }
+        default { '[INFO]', 'Gray' }
+    }
+    Write-Host ('  {0} ' -f $tag) -ForegroundColor $color -NoNewline
+    Write-Host ('{0,-30} {1}' -f $Item, $Result)
+}
+
+$leftProc    = @($left | Where-Object { $_ -like 'Process:*' })
+$leftUninst  = @($left | Where-Object { $_ -like 'Uninstall entry:*' })
+$leftProgDir = @($left | Where-Object { $_ -like 'Folder:*' -and $_ -match 'Program Files' })
+$leftUserDir = @($left | Where-Object { $_ -like 'Folder:*' -and $_ -notmatch 'Program Files' })
+$folderState = if ($pendingOnly) { 'WARN' } else { 'FAIL' }
+$folderText  = if ($pendingOnly) { 'deleted at next reboot' } else { 'still present' }
+
+$line = '=' * 70
+Write-Host "`n$line" -ForegroundColor Cyan
+Write-Host "  WPS OFFICE REMOVAL - RESULT   (v$ScriptVersion  |  $env:COMPUTERNAME  |  $(Get-Date -Format 'yyyy-MM-dd HH:mm'))" -ForegroundColor Cyan
+Write-Host $line -ForegroundColor Cyan
+
+if ($leftProc.Count -eq 0)    { Write-StatusRow 'WPS processes'        'None running' 'OK' }
+else                          { Write-StatusRow 'WPS processes'        "$($leftProc.Count) still running" 'FAIL' }
+if ($leftUninst.Count -eq 0)  { Write-StatusRow 'Programs & Features'  'No WPS entries' 'OK' }
+else                          { Write-StatusRow 'Programs & Features'  "$($leftUninst.Count) entry(s) remain" 'FAIL' }
+if ($leftProgDir.Count -eq 0) { Write-StatusRow 'Program Files\Kingsoft' 'Removed' 'OK' }
+else                          { Write-StatusRow 'Program Files\Kingsoft' $folderText $folderState }
+if ($leftUserDir.Count -eq 0) { Write-StatusRow 'User profile folders' "Clean ($(@($Profiles).Count) profile(s) checked)" 'OK' }
+else                          { Write-StatusRow 'User profile folders' "$($leftUserDir.Count) $folderText" $folderState }
+if ($script:DefaultsToReset.Count -eq 0) { Write-StatusRow 'Default apps' 'No WPS associations' 'OK' }
+else                          { Write-StatusRow 'Default apps' "$($script:DefaultsToReset.Count) to reset manually" 'WARN' }
+
+Write-Host ''
+Write-StatusRow 'Items removed'       $script:Stats.Removed 'INFO'
+Write-StatusRow 'Queued for reboot'   $script:Stats.Locked  $(if ($script:Stats.Locked) { 'WARN' } else { 'INFO' })
+Write-StatusRow 'Errors'              $script:Stats.Failed  $(if ($script:Stats.Failed) { 'FAIL' } else { 'OK' })
+
+if ($left.Count -gt 0) {
+    Write-Host "`n  Remaining items:" -ForegroundColor $(if ($pendingOnly) { 'Yellow' } else { 'Red' })
+    $left | ForEach-Object { Write-Host "    - $_" -ForegroundColor $(if ($pendingOnly) { 'Yellow' } else { 'Red' }) }
+}
 if ($script:DefaultsToReset.Count -gt 0) {
     Write-Host "`n  Default apps still pointing to WPS (protected by Windows, can't be changed by script):" -ForegroundColor Yellow
     Write-Host "    $($script:DefaultsToReset -join ', ')"
     Write-Host '    -> Signed in as the affected user: Settings > Apps > Default apps > Reset' -ForegroundColor Yellow
 }
 
-Write-Host ("`n  SUMMARY  Removed: {0}  |  Pending reboot: {1}  |  Failed: {2}  |  Defaults to reset: {3}" -f
-    $script:Stats.Removed, $script:Stats.Locked, $script:Stats.Failed, $script:DefaultsToReset.Count) -ForegroundColor Cyan
-if ($script:PendingReboot) { Write-Host '  Reboot required to finish.' -ForegroundColor Cyan }
-else { Write-Host '  Reboot recommended (unloads WPS shell extensions from Explorer).' -ForegroundColor Cyan }
-Write-Host "  Log: $logFile`n"
+Write-Host "`n$line" -ForegroundColor Cyan
+switch ($exitCode) {
+    0    { Write-Host '  OVERALL: CLEAN - WPS Office fully removed.' -ForegroundColor Green
+           Write-Host '  Reboot recommended (unloads WPS shell extensions from Explorer).' -ForegroundColor Gray }
+    3010 { Write-Host '  OVERALL: REMOVED - REBOOT REQUIRED to finish deleting locked files.' -ForegroundColor Yellow }
+    default { Write-Host '  OVERALL: INCOMPLETE - some items remain, check the log.' -ForegroundColor Red }
+}
+Write-Host "  Exit code : $exitCode"
+Write-Host "  Log file  : $logFile"
+Write-Host $line -ForegroundColor Cyan
 
-$exitCode = if ($left.Count -eq 0 -and -not $script:PendingReboot) { 0 }
-            elseif ($left.Count -eq 0 -or $pendingOnly)          { 3010 }
-            else                                                  { 1 }
-Write-Host "  Exit code: $exitCode"
 Stop-Transcript | Out-Null
 
 if ($Reboot) { & shutdown.exe /r /t 60 /c 'WPS Office removal complete - restarting in 60 seconds' }
+
+# ---------------------------------------------------------------- 12. pause / exit
+# Pause only when a technician is actually looking at the window.
+# Skipped for SYSTEM (RMM / Intune), non-interactive sessions, ISE/VS Code, or -NoPause.
+$isSystem    = ([Security.Principal.WindowsIdentity]::GetCurrent()).IsSystem
+$interactive = [Environment]::UserInteractive -and -not $isSystem -and -not $NoPause -and
+               $Host.Name -eq 'ConsoleHost' -and
+               -not ([Environment]::GetCommandLineArgs() -match '^-NonI')
+
+if ($interactive) {
+    if ($Reboot) { Write-Host "`n  PC will restart in 60 seconds (run 'shutdown /a' to cancel)." -ForegroundColor Yellow }
+    Write-Host "`n  Press any key to close..." -ForegroundColor Cyan -NoNewline
+    try {
+        $Host.UI.RawUI.FlushInputBuffer()   # ignore keys pressed while the script was running
+        [void]$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+    } catch { [void](Read-Host) }
+    Write-Host ''
+}
+
 exit $exitCode
