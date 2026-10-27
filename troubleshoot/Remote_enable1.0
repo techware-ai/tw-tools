@@ -1,0 +1,468 @@
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Techware IT Tools - WinRM Enable v1.1
+.DESCRIPTION
+    One-time setup on a TARGET PC so a technician can connect with
+    PowerShell Remoting (Enter-PSSession / Invoke-Command).
+    Covers network profile, WinRM service, firewall, UAC remote token
+    policy (workgroup local admins), ICMP, self-test and connection info.
+
+    Default run (firewall open to any address):
+      irm "https://raw.githubusercontent.com/techware-ai/tw-tools/main/remote/winrm_enable1.1.ps1" | iex
+
+    Restrict WinRM to a management subnet / IP:
+      & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/techware-ai/tw-tools/main/remote/winrm_enable1.1.ps1"))) -AllowedRemote "192.168.1.0/24"
+.NOTES
+    Support: support@techware.my
+    Run in an elevated PowerShell console on the target PC.
+#>
+param(
+    [string]$AllowedRemote = "Any",   # "Any", an IP, a subnet (192.168.1.0/24) or comma list
+    [switch]$SkipIcmp                 # skip enabling ping (ICMPv4 echo) inbound
+)
+
+# ============================================================
+#  GLOBALS & INIT
+# ============================================================
+$ScriptVersion = "1.1"
+$ScriptName    = "Techware IT Tools - WinRM Enable v$ScriptVersion"
+$SupportEmail  = "support@techware.my"
+$RunDate       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$Output        = [System.Collections.Generic.List[string]]::new()
+$Results       = [ordered]@{}   # step -> OK / WARN / ERR (for summary)
+
+$C = @{
+    Header  = 'Cyan'
+    Section = 'Yellow'
+    OK      = 'Green'
+    Warn    = 'Yellow'
+    Error   = 'Red'
+    Info    = 'White'
+    Dim     = 'DarkGray'
+}
+
+# ── Helper functions ─────────────────────────────────────────
+function Write-Header {
+    Clear-Host
+    $line = "=" * 70
+    Write-Host $line -ForegroundColor $C.Header
+    Write-Host "  $ScriptName" -ForegroundColor $C.Header
+    Write-Host "  Run: $RunDate" -ForegroundColor $C.Dim
+    Write-Host "  $SupportEmail" -ForegroundColor $C.Dim
+    Write-Host $line -ForegroundColor $C.Header
+    Write-Host ""
+}
+
+function Write-Section {
+    param([string]$Title, [int]$Num)
+    $line = "-" * 70
+    Write-Host ""
+    Write-Host $line -ForegroundColor $C.Section
+    Write-Host "  [$Num] $Title" -ForegroundColor $C.Section
+    Write-Host $line -ForegroundColor $C.Section
+    $script:Output.Add("")
+    $script:Output.Add($line)
+    $script:Output.Add("  [$Num] $Title")
+    $script:Output.Add($line)
+}
+
+function Out {
+    param([string]$Text = "", [string]$Color = "White")
+    Write-Host $Text -ForegroundColor $Color
+    $script:Output.Add($Text)
+}
+
+function Out-KV {
+    param([string]$Key, [string]$Value, [string]$Color = "White")
+    $line = "  {0,-30} {1}" -f $Key, $Value
+    Write-Host $line -ForegroundColor $Color
+    $script:Output.Add($line)
+}
+
+function Out-Status {
+    param([string]$Key, [string]$Value, [string]$Status)
+    $color = switch ($Status) {
+        "OK"    { $C.OK }
+        "WARN"  { $C.Warn }
+        "ERR"   { $C.Error }
+        default { $C.Info }
+    }
+    $line = "  {0,-30} {1}" -f $Key, $Value
+    Write-Host $line -ForegroundColor $color
+    $script:Output.Add($line)
+}
+
+function Set-Result {
+    param([string]$Step, [string]$Status)
+    $script:Results[$Step] = $Status
+}
+
+# ── Admin guard (#Requires is ignored when run via irm | iex) ─
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# ============================================================
+#  SECTION 1 — PRE-CHECKS
+# ============================================================
+function Get-PreCheck {
+    Write-Section "Pre-checks" 1
+
+    try {
+        $cs = Get-CimInstance Win32_ComputerSystem
+        $os = Get-CimInstance Win32_OperatingSystem
+
+        Out-KV "Hostname"           $env:COMPUTERNAME
+        Out-KV "Windows"            "$($os.Caption) (Build $($os.BuildNumber))"
+        Out-KV "PowerShell"         $PSVersionTable.PSVersion.ToString()
+        Out-KV "Running As"         "$env:USERDOMAIN\$env:USERNAME"
+
+        $script:IsDomain = [bool]$cs.PartOfDomain
+        if ($script:IsDomain) {
+            Out-KV "Join Type"      "Domain: $($cs.Domain)"
+        } else {
+            Out-KV "Join Type"      "Workgroup: $($cs.Workgroup)"
+        }
+
+        if ($os.Caption -match "Home") {
+            Out-Status "Edition Check" "Windows Home - WinRM inbound is limited/unsupported" "WARN"
+            Set-Result "Pre-checks" "WARN"
+        } else {
+            Out-Status "Edition Check" "Supported" "OK"
+            Set-Result "Pre-checks" "OK"
+        }
+
+        Out ""
+        Out "  IPv4 Addresses:" -Color $C.Dim
+        $script:IPs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notmatch "^(127\.|169\.254\.)" }
+        foreach ($ip in $script:IPs) {
+            Out-KV "  $($ip.InterfaceAlias)" "$($ip.IPAddress)/$($ip.PrefixLength)"
+        }
+    } catch {
+        Out "  [!] Error during pre-checks: $_" $C.Error
+        Set-Result "Pre-checks" "ERR"
+    }
+}
+
+# ============================================================
+#  SECTION 2 — NETWORK PROFILE
+# ============================================================
+function Set-NetworkProfile {
+    Write-Section "Network Profile" 2
+
+    try {
+        $profiles = Get-NetConnectionProfile -ErrorAction Stop
+        $status = "OK"
+        foreach ($p in $profiles) {
+            if ($p.NetworkCategory -eq "Public") {
+                try {
+                    Set-NetConnectionProfile -InterfaceIndex $p.InterfaceIndex -NetworkCategory Private -ErrorAction Stop
+                    Out-Status "  $($p.InterfaceAlias)" "Public -> Private (changed)" "OK"
+                } catch {
+                    Out-Status "  $($p.InterfaceAlias)" "Public - could not change: $($_.Exception.Message)" "WARN"
+                    $status = "WARN"
+                }
+            } else {
+                Out-Status "  $($p.InterfaceAlias)" "$($p.NetworkCategory) (no change)" "OK"
+            }
+        }
+        Set-Result "Network Profile" $status
+    } catch {
+        Out "  [!] Error reading network profiles: $_" $C.Error
+        Set-Result "Network Profile" "ERR"
+    }
+}
+
+# ============================================================
+#  SECTION 3 — WINRM SERVICE & LISTENER
+# ============================================================
+function Enable-WinRMService {
+    Write-Section "WinRM Service & Listener" 3
+
+    try {
+        Enable-PSRemoting -Force -SkipNetworkProfileCheck -ErrorAction Stop | Out-Null
+        Out-Status "Enable-PSRemoting" "Completed" "OK"
+
+        Set-Service WinRM -StartupType Automatic -ErrorAction Stop
+        if ((Get-Service WinRM).Status -ne "Running") { Start-Service WinRM -ErrorAction Stop }
+
+        $svc = Get-Service WinRM
+        $st  = if ($svc.Status -eq "Running") { "OK" } else { "ERR" }
+        Out-Status "WinRM Service" "$($svc.Status) / $($svc.StartType)" $st
+
+        # Listener check
+        $listeners = Get-ChildItem WSMan:\localhost\Listener -ErrorAction Stop
+        foreach ($l in $listeners) {
+            $keys = ($l.Keys -join ", ")
+            Out-KV "Listener"           $keys
+        }
+        if (-not $listeners) {
+            Out-Status "Listener" "None found" "ERR"
+            $st = "ERR"
+        }
+
+        # Basic auth / unencrypted stay disabled (secure defaults)
+        $unenc = (Get-Item WSMan:\localhost\Service\AllowUnencrypted).Value
+        $basic = (Get-Item WSMan:\localhost\Service\Auth\Basic).Value
+        Out-Status "AllowUnencrypted"   $unenc $(if ($unenc -eq "false") { "OK" } else { "WARN" })
+        Out-Status "Basic Auth"         $basic $(if ($basic -eq "false") { "OK" } else { "WARN" })
+
+        Set-Result "WinRM Service" $st
+    } catch {
+        Out "  [!] Error enabling WinRM: $_" $C.Error
+        Set-Result "WinRM Service" "ERR"
+    }
+}
+
+# ============================================================
+#  SECTION 4 — FIREWALL
+# ============================================================
+function Set-WinRMFirewall {
+    Write-Section "Firewall Rules" 4
+
+    try {
+        # Match by rule Name (not DisplayName) so it works on localised Windows
+        $rules = Get-NetFirewallRule -ErrorAction Stop |
+            Where-Object { $_.Name -like "WINRM-HTTP-In-TCP*" }
+
+        if (-not $rules) {
+            Out "  WinRM rule missing - creating TW rule." -Color $C.Warn
+            New-NetFirewallRule -Name "TW-WinRM-HTTP-In" -DisplayName "TW - WinRM HTTP-In (5985)" `
+                -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow `
+                -Profile Domain,Private -ErrorAction Stop | Out-Null
+            $rules = Get-NetFirewallRule -Name "TW-WinRM-HTTP-In"
+        }
+
+        $remote = if ($AllowedRemote -eq "Any") { "Any" } else { $AllowedRemote -split "\s*,\s*" }
+
+        foreach ($r in $rules) {
+            Enable-NetFirewallRule -Name $r.Name -ErrorAction Stop
+            Set-NetFirewallRule -Name $r.Name -RemoteAddress $remote -ErrorAction Stop
+            $prof = (Get-NetFirewallRule -Name $r.Name).Profile
+            Out-Status "  $($r.Name)" "Enabled  Profile: $prof  Remote: $($remote -join ',')" "OK"
+        }
+
+        if ($AllowedRemote -eq "Any") {
+            Out "  [i] Open to any address. Re-run with -AllowedRemote to restrict." -Color $C.Dim
+        }
+
+        # ICMP echo (ping) - helps troubleshooting
+        if (-not $SkipIcmp) {
+            $icmp = Get-NetFirewallRule -Name "FPS-ICMP4-ERQ-In*" -ErrorAction SilentlyContinue
+            if ($icmp) {
+                $icmp | Enable-NetFirewallRule
+                Out-Status "  ICMPv4 Echo (ping)" "Enabled" "OK"
+            } else {
+                New-NetFirewallRule -Name "TW-ICMPv4-Echo-In" -DisplayName "TW - ICMPv4 Echo In" `
+                    -Direction Inbound -Protocol ICMPv4 -IcmpType 8 -Action Allow `
+                    -Profile Domain,Private -ErrorAction SilentlyContinue | Out-Null
+                Out-Status "  ICMPv4 Echo (ping)" "Enabled (TW rule)" "OK"
+            }
+        }
+
+        Set-Result "Firewall" "OK"
+    } catch {
+        Out "  [!] Error configuring firewall: $_" $C.Error
+        Set-Result "Firewall" "ERR"
+    }
+}
+
+# ============================================================
+#  SECTION 5 — UAC REMOTE TOKEN POLICY
+# ============================================================
+function Set-TokenPolicy {
+    Write-Section "UAC Remote Token Policy (LocalAccountTokenFilterPolicy)" 5
+
+    try {
+        $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        $cur = (Get-ItemProperty $key -Name LocalAccountTokenFilterPolicy -ErrorAction SilentlyContinue).LocalAccountTokenFilterPolicy
+
+        if ($cur -eq 1) {
+            Out-Status "LocalAccountTokenFilterPolicy" "Already 1" "OK"
+        } else {
+            New-ItemProperty -Path $key -Name LocalAccountTokenFilterPolicy -Value 1 `
+                -PropertyType DWord -Force -ErrorAction Stop | Out-Null
+            Out-Status "LocalAccountTokenFilterPolicy" "Set to 1 (was: $(if ($null -eq $cur) {'not set'} else {$cur}))" "OK"
+        }
+        Out "  [i] Lets local admin accounts connect with a full admin token." -Color $C.Dim
+        if ($script:IsDomain) {
+            Out "      Domain PC: only needed if you connect with a LOCAL account." -Color $C.Dim
+        }
+        Set-Result "Token Policy" "OK"
+    } catch {
+        Out "  [!] Error setting token policy: $_" $C.Error
+        Set-Result "Token Policy" "ERR"
+    }
+}
+
+# ============================================================
+#  SECTION 6 — SELF-TEST
+# ============================================================
+function Test-WinRMLocal {
+    Write-Section "Self-test" 6
+
+    $status = "OK"
+    try {
+        Test-WSMan -ComputerName localhost -ErrorAction Stop | Out-Null
+        Out-Status "Test-WSMan localhost" "Responding" "OK"
+    } catch {
+        Out-Status "Test-WSMan localhost" "FAILED: $($_.Exception.Message)" "ERR"
+        $status = "ERR"
+    }
+
+    try {
+        $listen = Get-NetTCPConnection -LocalPort 5985 -State Listen -ErrorAction Stop
+        Out-Status "Port 5985" "Listening ($(($listen.LocalAddress | Sort-Object -Unique) -join ', '))" "OK"
+    } catch {
+        Out-Status "Port 5985" "NOT listening" "ERR"
+        $status = "ERR"
+    }
+
+    try {
+        $r = Invoke-Command -ComputerName localhost -ScriptBlock { $env:COMPUTERNAME } -ErrorAction Stop
+        Out-Status "Loopback session" "OK ($r)" "OK"
+    } catch {
+        Out-Status "Loopback session" "FAILED: $($_.Exception.Message)" "WARN"
+        if ($status -eq "OK") { $status = "WARN" }
+    }
+
+    Set-Result "Self-test" $status
+}
+
+# ============================================================
+#  SECTION 7 — CONNECTION INFO FOR TECHNICIAN
+# ============================================================
+function Get-ConnectionInfo {
+    Write-Section "Connection Info (for technician PC)" 7
+
+    try {
+        Out "  Local Administrators on this PC:" -Color $C.Dim
+        try {
+            $grp = Get-LocalGroup -SID "S-1-5-32-544" -ErrorAction Stop
+            Get-LocalGroupMember -Group $grp -ErrorAction Stop | ForEach-Object {
+                Out-KV "  $($_.ObjectClass)" $_.Name
+            }
+        } catch {
+            Out "  (Unable to list members - check lusrmgr.msc)" -Color $C.Warn
+        }
+
+        $ip   = ($script:IPs | Select-Object -First 1).IPAddress
+        $host_ = $env:COMPUTERNAME
+
+        Out ""
+        Out "  On the TECHNICIAN PC (elevated PowerShell):" -Color $C.Section
+        if (-not $script:IsDomain) {
+            Out "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value `"$ip`" -Concatenate -Force"
+        }
+        Out "    Test-WSMan $ip"
+        Out "    `$cred = Get-Credential `"$host_\<adminuser>`""
+        Out "    Enter-PSSession -ComputerName $(if ($script:IsDomain) { $host_ } else { $ip }) -Credential `$cred"
+        Out ""
+        Out "  Run a tw-tools script remotely:" -Color $C.Dim
+        Out "    Invoke-Command -ComputerName $ip -Credential `$cred -FilePath .\system_check1.0.ps1" -Color $C.Dim
+
+        Set-Result "Connection Info" "OK"
+    } catch {
+        Out "  [!] Error building connection info: $_" $C.Error
+        Set-Result "Connection Info" "ERR"
+    }
+}
+
+# ============================================================
+#  SECTION 8 — SUMMARY
+# ============================================================
+function Write-Summary {
+    Write-Section "Summary" 8
+
+    foreach ($k in $Results.Keys) {
+        $v = $Results[$k]
+        $label = switch ($v) { "OK" {"OK"} "WARN" {"WARNING"} "ERR" {"FAILED"} default {$v} }
+        Out-Status $k $label $v
+    }
+
+    Out ""
+    if ($Results.Values -contains "ERR") {
+        Out "  RESULT: Setup incomplete - review FAILED steps above." -Color $C.Error
+    } elseif ($Results.Values -contains "WARN") {
+        Out "  RESULT: WinRM enabled with warnings." -Color $C.Warn
+    } else {
+        Out "  RESULT: WinRM ready for remote connections." -Color $C.OK
+    }
+}
+
+# ============================================================
+#  EXPORT REPORT
+# ============================================================
+function Export-Report {
+    $fileName = "TW_WinRMEnable_$($env:COMPUTERNAME)_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+    $sep = "=" * 70
+    $header = [string[]]@(
+        $sep,
+        "  $ScriptName",
+        "  Generated : $RunDate",
+        "  Device    : $env:COMPUTERNAME",
+        "  Support   : $SupportEmail",
+        $sep
+    )
+    $all = $header + [string[]]$Output.ToArray()   # built before any path logic
+
+    $targets = @()
+    try { $targets += [Environment]::GetFolderPath("Desktop") } catch {}
+    $targets += $env:TEMP
+
+    foreach ($dir in $targets) {
+        if ([string]::IsNullOrWhiteSpace($dir) -or -not (Test-Path $dir)) { continue }
+        try {
+            $file = Join-Path $dir $fileName
+            [System.IO.File]::WriteAllLines($file, $all, [System.Text.Encoding]::UTF8)
+            Write-Host ""
+            Write-Host "  Report saved to:" -ForegroundColor $C.OK
+            Write-Host "  $file" -ForegroundColor $C.Header
+            return
+        } catch { continue }
+    }
+    Write-Host "  [!] Failed to save report." -ForegroundColor $C.Error
+}
+
+# ============================================================
+#  FOOTER
+# ============================================================
+function Write-Footer {
+    $line = "=" * 70
+    Write-Host ""
+    Write-Host $line -ForegroundColor $C.Header
+    Write-Host "  Techware IT Tools - WinRM Enable v$ScriptVersion complete." -ForegroundColor $C.Header
+    Write-Host "  $SupportEmail" -ForegroundColor $C.Dim
+    Write-Host $line -ForegroundColor $C.Header
+    Write-Host ""
+}
+
+# ============================================================
+#  MAIN
+# ============================================================
+Write-Header
+
+if (-not (Test-IsAdmin)) {
+    Write-Host "  [!] Run this in an elevated PowerShell (Run as Administrator)." -ForegroundColor $C.Error
+    Write-Footer
+    return
+}
+
+$script:IsDomain = $false
+$script:IPs      = @()
+
+Get-PreCheck
+Set-NetworkProfile
+Enable-WinRMService
+Set-WinRMFirewall
+Set-TokenPolicy
+Test-WinRMLocal
+Get-ConnectionInfo
+Write-Summary
+Export-Report
+
+Write-Footer
