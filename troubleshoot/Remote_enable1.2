@@ -1,21 +1,29 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Techware IT Tools - WinRM Enable v1.1
+    Techware IT Tools - WinRM Enable v1.2
 .DESCRIPTION
     One-time setup on a TARGET PC so a technician can connect with
     PowerShell Remoting (Enter-PSSession / Invoke-Command).
-    Covers network profile, WinRM service, firewall, UAC remote token
-    policy (workgroup local admins), ICMP, self-test and connection info.
+    Covers network profile, WinRM service, Windows Firewall, third-party
+    firewall detection, UAC remote token policy (workgroup local admins),
+    ICMP, self-test and connection info.
 
-    Default run (firewall open to any address):
-      irm "https://raw.githubusercontent.com/techware-ai/tw-tools/main/remote/winrm_enable1.1.ps1" | iex
+    Default run (Domain/Private open to any address, Public = LocalSubnet):
+      irm "https://raw.githubusercontent.com/techware-ai/tw-tools/main/remote/winrm_enable1.2.ps1" | iex
 
     Restrict WinRM to a management subnet / IP:
-      & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/techware-ai/tw-tools/main/remote/winrm_enable1.1.ps1"))) -AllowedRemote "192.168.1.0/24"
+      & ([scriptblock]::Create((irm "https://raw.githubusercontent.com/techware-ai/tw-tools/main/remote/winrm_enable1.2.ps1"))) -AllowedRemote "192.168.1.0/24"
 .NOTES
     Support: support@techware.my
     Run in an elevated PowerShell console on the target PC.
+
+    v1.2 changes:
+      - Public firewall profile never opened to "Any" (kept at LocalSubnet)
+      - Third-party firewall detection (SecurityCenter2) + Windows Firewall state
+      - Loopback auth test removed (false failure with Microsoft accounts /
+        Credential Guard - 0x8009030e)
+      - Connection info lists every IPv4 address instead of guessing one
 #>
 param(
     [string]$AllowedRemote = "Any",   # "Any", an IP, a subnet (192.168.1.0/24) or comma list
@@ -25,12 +33,17 @@ param(
 # ============================================================
 #  GLOBALS & INIT
 # ============================================================
-$ScriptVersion = "1.1"
+$ScriptVersion = "1.2"
 $ScriptName    = "Techware IT Tools - WinRM Enable v$ScriptVersion"
 $SupportEmail  = "support@techware.my"
 $RunDate       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 $Output        = [System.Collections.Generic.List[string]]::new()
 $Results       = [ordered]@{}   # step -> OK / WARN / ERR (for summary)
+
+$script:IsDomain   = $false
+$script:IPs        = @()
+$script:FwWarn     = $false
+$script:FwProducts = @()
 
 $C = @{
     Header  = 'Cyan'
@@ -137,8 +150,8 @@ function Get-PreCheck {
 
         Out ""
         Out "  IPv4 Addresses:" -Color $C.Dim
-        $script:IPs = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.IPAddress -notmatch "^(127\.|169\.254\.)" }
+        $script:IPs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.IPAddress -notmatch "^(127\.|169\.254\.)" })
         foreach ($ip in $script:IPs) {
             Out-KV "  $($ip.InterfaceAlias)" "$($ip.IPAddress)/$($ip.PrefixLength)"
         }
@@ -194,18 +207,16 @@ function Enable-WinRMService {
         $st  = if ($svc.Status -eq "Running") { "OK" } else { "ERR" }
         Out-Status "WinRM Service" "$($svc.Status) / $($svc.StartType)" $st
 
-        # Listener check
         $listeners = Get-ChildItem WSMan:\localhost\Listener -ErrorAction Stop
         foreach ($l in $listeners) {
-            $keys = ($l.Keys -join ", ")
-            Out-KV "Listener"           $keys
+            Out-KV "Listener"           ($l.Keys -join ", ")
         }
         if (-not $listeners) {
             Out-Status "Listener" "None found" "ERR"
             $st = "ERR"
         }
 
-        # Basic auth / unencrypted stay disabled (secure defaults)
+        # Secure defaults - should stay false
         $unenc = (Get-Item WSMan:\localhost\Service\AllowUnencrypted).Value
         $basic = (Get-Item WSMan:\localhost\Service\Auth\Basic).Value
         Out-Status "AllowUnencrypted"   $unenc $(if ($unenc -eq "false") { "OK" } else { "WARN" })
@@ -219,35 +230,43 @@ function Enable-WinRMService {
 }
 
 # ============================================================
-#  SECTION 4 — FIREWALL
+#  SECTION 4 — WINDOWS FIREWALL
 # ============================================================
 function Set-WinRMFirewall {
-    Write-Section "Firewall Rules" 4
+    Write-Section "Windows Firewall Rules" 4
 
     try {
         # Match by rule Name (not DisplayName) so it works on localised Windows
-        $rules = Get-NetFirewallRule -ErrorAction Stop |
-            Where-Object { $_.Name -like "WINRM-HTTP-In-TCP*" }
+        $rules = @(Get-NetFirewallRule -ErrorAction Stop |
+            Where-Object { $_.Name -like "WINRM-HTTP-In-TCP*" })
 
         if (-not $rules) {
             Out "  WinRM rule missing - creating TW rule." -Color $C.Warn
             New-NetFirewallRule -Name "TW-WinRM-HTTP-In" -DisplayName "TW - WinRM HTTP-In (5985)" `
                 -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow `
                 -Profile Domain,Private -ErrorAction Stop | Out-Null
-            $rules = Get-NetFirewallRule -Name "TW-WinRM-HTTP-In"
+            $rules = @(Get-NetFirewallRule -Name "TW-WinRM-HTTP-In")
         }
 
         $remote = if ($AllowedRemote -eq "Any") { "Any" } else { $AllowedRemote -split "\s*,\s*" }
 
         foreach ($r in $rules) {
             Enable-NetFirewallRule -Name $r.Name -ErrorAction Stop
-            Set-NetFirewallRule -Name $r.Name -RemoteAddress $remote -ErrorAction Stop
-            $prof = (Get-NetFirewallRule -Name $r.Name).Profile
-            Out-Status "  $($r.Name)" "Enabled  Profile: $prof  Remote: $($remote -join ',')" "OK"
+            $prof = (Get-NetFirewallRule -Name $r.Name).Profile.ToString()
+
+            # Never open the Public profile to Any (cafe / hotel Wi-Fi)
+            if ($prof -match "Public" -and $AllowedRemote -eq "Any") {
+                $applied = "LocalSubnet"
+            } else {
+                $applied = $remote
+            }
+            Set-NetFirewallRule -Name $r.Name -RemoteAddress $applied -ErrorAction Stop
+            Out-Status "  $($r.Name)" "Enabled  Profile: $prof  Remote: $($applied -join ',')" "OK"
         }
 
         if ($AllowedRemote -eq "Any") {
-            Out "  [i] Open to any address. Re-run with -AllowedRemote to restrict." -Color $C.Dim
+            Out "  [i] Domain/Private open to any address; Public kept at LocalSubnet." -Color $C.Dim
+            Out "      Re-run with -AllowedRemote to restrict further." -Color $C.Dim
         }
 
         # ICMP echo (ping) - helps troubleshooting
@@ -264,18 +283,82 @@ function Set-WinRMFirewall {
             }
         }
 
-        Set-Result "Firewall" "OK"
+        # Windows Firewall on/off per profile
+        Out ""
+        $wfOff = @(Get-NetFirewallProfile -ErrorAction SilentlyContinue | Where-Object { -not $_.Enabled })
+        if ($wfOff.Count -gt 0) {
+            Out-Status "  Windows Firewall" "OFF on: $(($wfOff.Name) -join ', ')" "WARN"
+            Out "      Rules above are not enforced on those profiles." -Color $C.Dim
+        } else {
+            Out-Status "  Windows Firewall" "ON (all profiles)" "OK"
+        }
+
+        Set-Result "Windows Firewall" "OK"
     } catch {
         Out "  [!] Error configuring firewall: $_" $C.Error
-        Set-Result "Firewall" "ERR"
+        Set-Result "Windows Firewall" "ERR"
     }
 }
 
 # ============================================================
-#  SECTION 5 — UAC REMOTE TOKEN POLICY
+#  SECTION 5 — THIRD-PARTY FIREWALL
+# ============================================================
+function Get-ThirdPartyFirewall {
+    Write-Section "Third-party Firewall" 5
+
+    try {
+        # SecurityCenter2 exists on Windows client only (not Server)
+        $fw3 = @(Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct -ErrorAction Stop)
+
+        if ($fw3.Count -eq 0) {
+            Out-Status "  Registered products" "None - Windows Firewall in control" "OK"
+            Set-Result "3rd-party Firewall" "OK"
+            return
+        }
+
+        foreach ($f in $fw3) {
+            $enabled = ($f.productState -band 0x1000) -ne 0
+            if ($enabled) {
+                Out-Status "  $($f.displayName)" "ACTIVE" "WARN"
+                $script:FwProducts += $f.displayName
+            } else {
+                Out-Status "  $($f.displayName)" "Installed, not active" "OK"
+            }
+        }
+
+        if ($script:FwProducts.Count -gt 0) {
+            $script:FwWarn = $true
+            Out ""
+            Out "  [!] A third-party firewall controls inbound traffic." -Color $C.Warn
+            Out "      Add an inbound ALLOW rule in that product manually:" -Color $C.Warn
+            Out "        Protocol TCP, Local port 5985, Remote = Local subnet only" -Color $C.Warn
+
+            if ($script:FwProducts -match "Norton|Symantec") {
+                Out ""
+                Out "  Norton: Settings > Firewall > Traffic Rules > Add" -Color $C.Dim
+                Out "          Allow / Connections from other computers /" -Color $C.Dim
+                Out "          Local subnet / TCP / local port 5985" -Color $C.Dim
+                Out "          Name: TW - WinRM 5985  > Save > Apply" -Color $C.Dim
+            }
+            Out ""
+            Out "  [i] Verify from technician PC:" -Color $C.Dim
+            Out "      Test-NetConnection <target-IP> -Port 5985" -Color $C.Dim
+
+            Set-Result "3rd-party Firewall" "WARN"
+        } else {
+            Set-Result "3rd-party Firewall" "OK"
+        }
+    } catch {
+        Out "  [i] SecurityCenter2 not available (Server OS) - check manually." -Color $C.Dim
+        Set-Result "3rd-party Firewall" "INFO"
+    }
+}
+
+# ============================================================
+#  SECTION 6 — UAC REMOTE TOKEN POLICY
 # ============================================================
 function Set-TokenPolicy {
-    Write-Section "UAC Remote Token Policy (LocalAccountTokenFilterPolicy)" 5
+    Write-Section "UAC Remote Token Policy (LocalAccountTokenFilterPolicy)" 6
 
     try {
         $key = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
@@ -300,10 +383,10 @@ function Set-TokenPolicy {
 }
 
 # ============================================================
-#  SECTION 6 — SELF-TEST
+#  SECTION 7 — SELF-TEST
 # ============================================================
 function Test-WinRMLocal {
-    Write-Section "Self-test" 6
+    Write-Section "Self-test" 7
 
     $status = "OK"
     try {
@@ -322,22 +405,18 @@ function Test-WinRMLocal {
         $status = "ERR"
     }
 
-    try {
-        $r = Invoke-Command -ComputerName localhost -ScriptBlock { $env:COMPUTERNAME } -ErrorAction Stop
-        Out-Status "Loopback session" "OK ($r)" "OK"
-    } catch {
-        Out-Status "Loopback session" "FAILED: $($_.Exception.Message)" "WARN"
-        if ($status -eq "OK") { $status = "WARN" }
-    }
+    Out ""
+    Out "  [i] Local tests bypass the firewall (loopback). Confirm from the" -Color $C.Dim
+    Out "      technician PC with Test-NetConnection + Enter-PSSession -Credential." -Color $C.Dim
 
     Set-Result "Self-test" $status
 }
 
 # ============================================================
-#  SECTION 7 — CONNECTION INFO FOR TECHNICIAN
+#  SECTION 8 — CONNECTION INFO FOR TECHNICIAN
 # ============================================================
 function Get-ConnectionInfo {
-    Write-Section "Connection Info (for technician PC)" 7
+    Write-Section "Connection Info (for technician PC)" 8
 
     try {
         Out "  Local Administrators on this PC:" -Color $C.Dim
@@ -350,20 +429,25 @@ function Get-ConnectionInfo {
             Out "  (Unable to list members - check lusrmgr.msc)" -Color $C.Warn
         }
 
-        $ip   = ($script:IPs | Select-Object -First 1).IPAddress
-        $host_ = $env:COMPUTERNAME
+        Out ""
+        Out "  Reachable on (pick the network the technician is on):" -Color $C.Dim
+        foreach ($i in $script:IPs) {
+            Out-KV "    $($i.IPAddress)" $i.InterfaceAlias
+        }
+
+        $target = if ($script:IsDomain) { $env:COMPUTERNAME } else { "<target-IP>" }
 
         Out ""
         Out "  On the TECHNICIAN PC (elevated PowerShell):" -Color $C.Section
+        Out "    Test-NetConnection <target-IP> -Port 5985"
         if (-not $script:IsDomain) {
-            Out "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value `"$ip`" -Concatenate -Force"
+            Out "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value `"<target-IP>`" -Concatenate -Force"
         }
-        Out "    Test-WSMan $ip"
-        Out "    `$cred = Get-Credential `"$host_\<adminuser>`""
-        Out "    Enter-PSSession -ComputerName $(if ($script:IsDomain) { $host_ } else { $ip }) -Credential `$cred"
+        Out "    `$cred = Get-Credential `"$env:COMPUTERNAME\<adminuser>`""
+        Out "    Enter-PSSession -ComputerName $target -Credential `$cred"
         Out ""
         Out "  Run a tw-tools script remotely:" -Color $C.Dim
-        Out "    Invoke-Command -ComputerName $ip -Credential `$cred -FilePath .\system_check1.0.ps1" -Color $C.Dim
+        Out "    Invoke-Command -ComputerName $target -Credential `$cred -FilePath .\system_check1.0.ps1" -Color $C.Dim
 
         Set-Result "Connection Info" "OK"
     } catch {
@@ -373,24 +457,26 @@ function Get-ConnectionInfo {
 }
 
 # ============================================================
-#  SECTION 8 — SUMMARY
+#  SECTION 9 — SUMMARY
 # ============================================================
 function Write-Summary {
-    Write-Section "Summary" 8
+    Write-Section "Summary" 9
 
     foreach ($k in $Results.Keys) {
         $v = $Results[$k]
-        $label = switch ($v) { "OK" {"OK"} "WARN" {"WARNING"} "ERR" {"FAILED"} default {$v} }
+        $label = switch ($v) { "OK" {"OK"} "WARN" {"WARNING"} "ERR" {"FAILED"} "INFO" {"CHECK MANUALLY"} default {$v} }
         Out-Status $k $label $v
     }
 
     Out ""
     if ($Results.Values -contains "ERR") {
         Out "  RESULT: Setup incomplete - review FAILED steps above." -Color $C.Error
+    } elseif ($script:FwWarn) {
+        Out "  RESULT: WinRM enabled - ACTION NEEDED: open TCP 5985 in $($script:FwProducts -join ', ')." -Color $C.Warn
     } elseif ($Results.Values -contains "WARN") {
         Out "  RESULT: WinRM enabled with warnings." -Color $C.Warn
     } else {
-        Out "  RESULT: WinRM ready for remote connections." -Color $C.OK
+        Out "  RESULT: WinRM ready - confirm from technician PC." -Color $C.OK
     }
 }
 
@@ -452,13 +538,11 @@ if (-not (Test-IsAdmin)) {
     return
 }
 
-$script:IsDomain = $false
-$script:IPs      = @()
-
 Get-PreCheck
 Set-NetworkProfile
 Enable-WinRMService
 Set-WinRMFirewall
+Get-ThirdPartyFirewall
 Set-TokenPolicy
 Test-WinRMLocal
 Get-ConnectionInfo
